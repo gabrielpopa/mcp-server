@@ -1,0 +1,20 @@
+# systemd (DietPi/Raspberry Pi) — for stdio *via* a client wrapper (example)
+# Save as: /etc/systemd/system/mcp-demo.service
+# Note: stdio MCP usually launched by the client process. Use HTTP mode for services.
+[Unit]
+Description=Demo MCP Server (HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/mcp-demo
+Environment=MCP_TRANSPORT=http
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
+ExecStart=/usr/bin/python3 /opt/mcp-demo/server.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

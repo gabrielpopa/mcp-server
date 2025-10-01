@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run mcp server with env",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/server.py",
+      "console": "integratedTerminal",
+      "env": {
+        "MCP_TRANSPORT": "http",
+        "HOST": "0.0.0.0",
+        "PORT": "3000"
+      }
+    }
+  ]
+}

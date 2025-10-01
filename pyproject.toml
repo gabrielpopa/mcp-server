@@ -1,0 +1,23 @@
+# pyproject.toml
+[project]
+name = "mcp-demo"
+version = "0.1.0"
+description = "Minimal MCP server exposing stdio + Streamable HTTP"
+authors = [{ name = "you" }]
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.8.0",        # official MCP Python SDK (Streamable HTTP support)
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+]
+
+[tool.uvicorn]
+factory = false
+
+# --- optional runner scripts (if you use uv instead of pip, adapt accordingly) ---
+[project.scripts]
+# local stdio run
+mcp-demo-stdio = "server:run_stdio"
+# ASGI app factory for HTTP
+demo-http-app = "server:build_http_app"
+
