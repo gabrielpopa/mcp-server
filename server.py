@@ -10,15 +10,12 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-
-from mcp.server.fastmcp import FastMCP  # Official Python SDK
-
-import json
 import re
-import shlex
 import socket
 import subprocess
 from typing import List, Dict, Optional
+
+from mcp.server.fastmcp import FastMCP  # Official Python SDK
 
 # Name your server (what clients will see)
 mcp = FastMCP("ryzen", stateless_http=True)
