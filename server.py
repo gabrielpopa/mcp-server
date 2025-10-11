@@ -154,6 +154,41 @@ def add_note(title: str, body: str) -> Dict[str, str]:
     note = store.add(title=title, body=body or "")
     return asdict(note)
 
+# Prompt ---------------------------------------------------------------------
+@mcp.prompt('add-note')
+def add_note_prompt() -> str:
+    """Interactive prompt to add a note through chat input."""
+    return (
+        "Let's create a new note.\n"
+        "Ask the user for title and body.\n"
+        "Once both are known, call add_note(title='<title>', body='<body>').\n"
+        "Return the created note summary: ID, title, and creation time."
+    )
+
+@mcp.tool()
+def edit_note(id: str, title: Optional[str] = None, body: Optional[str] = None) -> Dict[str, str]:
+    """Edit an existing note by ID, updating its title and/or body.
+
+    Args:
+        id: The note ID to modify.
+        title: Optional new title.
+        body: Optional new body.
+
+    Returns:
+        The updated note as a dict.
+    """
+    with store._lock:
+        note = store._notes.get(id)
+        if not note:
+            raise ValueError(f"note {id} not found")
+        if title is not None:
+            note.title = title.strip()
+        if body is not None:
+            note.body = body.strip()
+        note.updated_at = datetime.now(timezone.utc).strftime(ISO)
+        store._save()
+        return asdict(note)
+
 
 # ---- Entrypoint -------------------------------------------------------------
 if __name__ == "__main__":
