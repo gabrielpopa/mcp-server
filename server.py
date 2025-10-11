@@ -1,219 +1,161 @@
-# server.py
 """
-Minimal MCP server in Python exposing BOTH transports:
-- stdio (local)
-- Streamable HTTP (remote)
+Minimal MCP server exposing a simple Notes system via tools.
+- Transports: stdio (default) and streamable HTTP (uvicorn)
+- Python: 3.11+
 
-Tested with: Python 3.11+
+Tools:
+1) list_notes() -> List of {id, title, created_at, updated_at}
+2) read_notes(ids: Optional[List[str]] = None, all: bool = False) -> List of full notes
+3) add_note(title: str, body: str) -> Created note {id, title, body, created_at, updated_at}
+
+Notes are persisted to a JSON file for durability.
+Set NOTES_PATH env var to customize the store location (default: ./notes.json).
 """
 from __future__ import annotations
 
+import json
 import os
+import threading
+import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-import re
-import socket
-import subprocess
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
-from mcp.server.fastmcp import FastMCP  # Official Python SDK
+from mcp.server.fastmcp import FastMCP
+
+ISO = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+# ------------------------------- Data Model ---------------------------------
+@dataclass
+class Note:
+    id: str
+    title: str
+    body: str
+    created_at: str
+    updated_at: str
+
+
+class NoteStore:
+    def __init__(self, path: str):
+        self._path = path
+        self._lock = threading.RLock()
+        self._notes: Dict[str, Note] = {}
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            if not os.path.exists(self._path):
+                self._notes = {}
+                return
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                self._notes = {n["id"]: Note(**n) for n in raw}
+            except Exception:
+                # Corrupt or empty file -> start clean but keep the file so we don't overwrite unintentionally.
+                self._notes = {}
+
+    def _save(self) -> None:
+        with self._lock:
+            tmp = self._path + ".tmp"
+            data = [asdict(n) for n in self._notes.values()]
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._path)
+
+    def list(self) -> List[Note]:
+        with self._lock:
+            # Return sorted by updated_at desc
+            return sorted(self._notes.values(), key=lambda n: n.updated_at, reverse=True)
+
+    def get_many(self, ids: Optional[List[str]] = None) -> List[Note]:
+        with self._lock:
+            if ids is None:
+                return list(self._notes.values())
+            out: List[Note] = []
+            for i in ids:
+                n = self._notes.get(i)
+                if n:
+                    out.append(n)
+            return out
+
+    def add(self, title: str, body: str) -> Note:
+        now = datetime.now(timezone.utc).strftime(ISO)
+        note = Note(id=str(uuid.uuid4()), title=title.strip(), body=body, created_at=now, updated_at=now)
+        with self._lock:
+            self._notes[note.id] = note
+            self._save()
+        return note
+
+    def touch(self, note_id: str) -> Optional[Note]:
+        with self._lock:
+            n = self._notes.get(note_id)
+            if not n:
+                return None
+            n.updated_at = datetime.now(timezone.utc).strftime(ISO)
+            self._save()
+            return n
+
+
+# ----------------------------- MCP Server -----------------------------------
+NOTES_PATH = os.getenv("NOTES_PATH", os.path.abspath("./notes.json"))
+store = NoteStore(NOTES_PATH)
 
 # Name your server (what clients will see)
-mcp = FastMCP("ryzen", stateless_http=True)
+mcp = FastMCP("mcp-notes", stateless_http=True)
 
 
-# ---- Tools -----------------------------------------------------------------
+# ---- Tools ------------------------------------------------------------------
 @mcp.tool()
-def echo(text: str) -> str:
-    """Return the same text back. Useful for wiring tests."""
-    return text + " h1ello"
+def list_notes() -> List[Dict[str, str]]:
+    """List notes with minimal metadata.
 
-
-@mcp.tool()
-def now(utc: bool = True) -> str:
-    """Return current time (UTC by default) in ISO 8601."""
-    dt = datetime.now(timezone.utc if utc else None)
-    return dt.isoformat()
-
-
-def _get_service_name(port: int, proto: str) -> Optional[str]:
-    try:
-        return socket.getservbyport(port, proto)
-    except Exception:
-        return None
-
-def _parse_ss_line(line: str) -> Optional[Dict]:
-    # Expected (with -H): Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
-    # Split to max 6 fields to keep the 'Process' column intact even if it contains spaces.
-    parts = line.split(None, 6)
-    if len(parts) < 6:
-        return None
-
-    proto = parts[0]  # tcp/udp
-    state = parts[1]
-    local = parts[4]
-    process_blob = parts[6] if len(parts) >= 7 else ""
-
-    # Extract address and port from "IP:PORT" (IPv6 might be [::]:80 or [::ffff:127.0.0.1]:8080)
-    port = None
-    local_addr = local
-    m = re.search(r':(\d+)$', local)
-    if m:
-        port = int(m.group(1))
-        local_addr = local[: m.start()]
-
-    # Extract process name and pid from users:(("proc",pid=123,fd=3),(...))
-    proc_name = None
-    pid = None
-    m2 = re.search(r'users:\(\("([^"]+)"(?:,pid=(\d+))?', process_blob)
-    if m2:
-        proc_name = m2.group(1)
-        if m2.lastindex and m2.group(2):
-            pid = int(m2.group(2))
-
-    return {
-        "proto": proto.lower(),
-        "port": port,
-        "service": _get_service_name(port, proto.lower()) if port else None,
-        "process": proc_name,
-        "pid": pid,
-        "state": state,
-        "local_addr": local_addr,
-    }
-
-def _run_ss(tcp: bool, udp: bool) -> List[Dict]:
-    results: List[Dict] = []
-    cmds = []
-    if tcp:
-        cmds.append(["ss", "-H", "-lptn"])  # listening, process, tcp numeric
-    if udp:
-        cmds.append(["ss", "-H", "-lpnu"])  # listening, process, udp numeric
-
-    for cmd in cmds:
-        try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            continue
-        for line in out.strip().splitlines():
-            item = _parse_ss_line(line.strip())
-            if item and item.get("port"):
-                results.append(item)
-    return results
-
-def _run_lsof(tcp: bool, udp: bool) -> List[Dict]:
-    # lsof -nP -iTCP -sTCP:LISTEN  and lsof -nP -iUDP
-    results: List[Dict] = []
-
-    def parse_lsof(out: str, proto_hint: str) -> None:
-        # Columns are variable; we’ll regex for COMMAND, PID, NODE (TCP/UDP), NAME (addr:port)
-        for line in out.strip().splitlines():
-            if line.startswith("COMMAND"):
-                continue
-            # Example NAME: *:22 (LISTEN)  or  0.0.0.0:53  or [::]:3000
-            m = re.search(r'\s(\*|[\[\]0-9a-fA-F\.:]+):(\d+)', line)
-            if not m:
-                continue
-            port = int(m.group(2))
-
-            # Grab PID and COMMAND
-            m_pid = re.search(r'\s(\d+)\s', line)  # first number after COMMAND is usually PID
-            pid = int(m_pid.group(1)) if m_pid else None
-            m_cmd = re.match(r'^(\S+)', line)
-            cmd_name = m_cmd.group(1) if m_cmd else None
-
-            results.append({
-                "proto": proto_hint,
-                "port": port,
-                "service": _get_service_name(port, proto_hint),
-                "process": cmd_name,
-                "pid": pid,
-                "state": "LISTEN",
-                "local_addr": None,
-            })
-
-    if tcp:
-        try:
-            out = subprocess.check_output(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], stderr=subprocess.STDOUT, text=True)
-            parse_lsof(out, "tcp")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-    if udp:
-        try:
-            out = subprocess.check_output(["lsof", "-nP", "-iUDP"], stderr=subprocess.STDOUT, text=True)
-            parse_lsof(out, "udp")
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-
-    return results
-
-def _dedupe(items: List[Dict]) -> List[Dict]:
-    seen = set()
-    deduped = []
-    for it in items:
-        key = (it.get("proto"), it.get("port"), it.get("pid"), it.get("process"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(it)
-    return deduped
-
-@mcp.tool()
-def list_open_ports(tcp: bool = True, udp: bool = True) -> List[Dict]:
+    Returns a list of dicts: {id, title, created_at, updated_at} sorted by updated_at desc.
     """
-    List listening (open) ports and associated service/process using local system commands.
+    return [
+        {
+            "id": n.id,
+            "title": n.title,
+            "created_at": n.created_at,
+            "updated_at": n.updated_at,
+        }
+        for n in store.list()
+    ]
+
+
+@mcp.tool()
+def read_notes(ids: Optional[List[str]] = None, all: bool = False) -> List[Dict[str, str]]:
+    """Read notes by ID or read all when `all=True`.
+
     Args:
-      tcp (bool): include TCP listening sockets
-      udp (bool): include UDP listening sockets
+        ids: Optional list of note IDs to read. Ignored when `all=True`.
+        all: When True, returns every note in the store.
+
     Returns:
-      List[Dict]: [{proto, port, service, process, pid, state, local_addr}]
-    Notes:
-      - Uses `ss` with -p to include process info; non-root users may see only their own processes.
-      - Falls back to `lsof` if `ss` is unavailable or restricted.
-      - Service is derived from /etc/services via socket.getservbyport and may be None for custom apps (e.g., port 3000).
+        List of full notes: {id, title, body, created_at, updated_at}
     """
-    data = _run_ss(tcp, udp)
-    if not data:
-        data = _run_lsof(tcp, udp)
-    data = _dedupe(data)
-    # nice sort: by proto, then port
-    data.sort(key=lambda d: (d.get("proto") or "", d.get("port") or 0))
-    return data
+    sel: List[Note]
+    if all:
+        sel = store.get_many(None)
+    else:
+        sel = store.get_many(ids or [])
+    return [asdict(n) for n in sel]
 
-@mcp.prompt()
-def check_port_service(port: int) -> str:
+
+@mcp.tool()
+def add_note(title: str, body: str) -> Dict[str, str]:
+    """Insert a new note with title and body and return the created note.
+
+    Title and body are trimmed minimally; UUIDv4 is used for the note id.
     """
-    Check what service/process is running on a given port.
-    Args:
-      port (int): Port number to check
-    Returns:
-      A human-readable string describing what (if anything) is bound to that port.
-    """
-
-    # Reuse our open ports tool
-    all_ports = list_open_ports()
-
-    matches = [p for p in all_ports if p.get("port") == port]
-    if not matches:
-        return f"No process is currently listening on port {port}."
-
-    lines = []
-    for m in matches:
-        proc = m.get("process") or "unknown"
-        pid = m.get("pid") or "?"
-        svc = m.get("service") or "unknown/custom"
-        proto = m.get("proto") or "?"
-        lines.append(
-            f"Port {port}/{proto}: service '{svc}', process '{proc}' (pid {pid}), state {m.get('state')}"
-        )
-
-    return "\n".join(lines)
-
-# ---- Resources (example: a simple in-memory resource) ----------------------
-@mcp.resource("demo:readme")
-def readme() -> str:
-    """A tiny resource example clients can `read_resource` from."""
-    return "Demo MCP server is up. Tools: echo, now. Resource: demo:readme"
+    if not title or not title.strip():
+        raise ValueError("title is required")
+    note = store.add(title=title, body=body or "")
+    return asdict(note)
 
 
-# ---- Entrypoint ------------------------------------------------------------
+# ---- Entrypoint -------------------------------------------------------------
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     if transport == "http":
